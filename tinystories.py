@@ -17,9 +17,15 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
+
+
+
 from tokenizer import Tokenizer
 
 DATA_CACHE_DIR = "data"
+DATA_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories_all_data.tar.gz"
+FILE_NAME = "TinyStories_all_data.tar.gz"
+UNPACKED_DIRNAME = "TinyStories_all_data"
 
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
@@ -37,28 +43,36 @@ def download_file(url: str, fname: str, chunk_size=1024):
             bar.update(size)
 
 
-def download():
-    """Downloads the TinyStories dataset to DATA_CACHE_DIR"""
-    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
-    # download the TinyStories dataset, unless it's already downloaded
-    data_url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories_all_data.tar.gz"
-    data_filename = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data.tar.gz")
+def download(data_url=DATA_URL, cache_dir=DATA_CACHE_DIR, filename=FILE_NAME, unpacked_dirname=UNPACKED_DIRNAME):
+    """
+    Downloads and unpacks a dataset.
+    
+    Args:
+    - data_url: URL to download the dataset from.
+    - cache_dir: Directory where the dataset will be downloaded.
+    - filename: Name of the file that will be downloaded.
+    - unpacked_dirname: Name of the directory where the dataset will be unpacked.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    data_filename = os.path.join(cache_dir, filename)
+    
+    # download the dataset, unless it's already downloaded
     if not os.path.exists(data_filename):
         print(f"Downloading {data_url} to {data_filename}...")
-        download_file(data_url, data_filename)
+        download_file(data_url, data_filename)  # Assuming download_file is available in your code
     else:
         print(f"{data_filename} already exists, skipping download...")
-
-    # unpack the tar.gz file into all the data shards (json files)
-    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+    
+    # unpack the file (assuming it's a tar.gz) into the specified directory
+    data_dir = os.path.join(cache_dir, unpacked_dirname)
     if not os.path.exists(data_dir):
         os.makedirs(data_dir, exist_ok=True)
         print(f"Unpacking {data_filename}...")
         os.system(f"tar -xzf {data_filename} -C {data_dir}")
     else:
         print(f"{data_dir} already exists, skipping unpacking...")
-
+    
     # print a single example just for debugging and such
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     with open(shard_filenames[0], "r") as f:
@@ -66,6 +80,7 @@ def download():
     print("Download done.")
     print(f"Number of shards: {len(shard_filenames)}")
     print(f"Example story:\n{data[0]}")
+
 
 def train_vocab(vocab_size):
     """
@@ -167,54 +182,75 @@ def pretokenize(vocab_size):
 
 
 class PretokDataset(torch.utils.data.IterableDataset):
-    """Loads pretokenized examples from disk and yields them as PyTorch tensors."""
+    """
+    Loads pretokenized examples from disk and yields them as PyTorch tensors.
+    """
 
-    def __init__(self, split, max_seq_len, vocab_size, vocab_source):
+    def __init__(self, split, max_seq_len, vocab_size, vocab_source, data_cache_dir=None):
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.vocab_source = vocab_source
+        self.data_cache_dir = data_cache_dir or DATA_CACHE_DIR
 
-    def __iter__(self):
-        # get worker info within a DataLoader
+    @staticmethod
+    def _generate_rng_seed(worker_id, rank):
+        """Generate a unique seed for random number generator."""
+        return 42 + worker_id + 1337 * rank
+
+    def _initialize_rng(self):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
-        # get DDP rank info
         rank = dist.get_rank() if dist.is_initialized() else 0
-        # combine the worker_id and worker_rank to create a unique seed for rng
-        seed = 42 + worker_id + 1337 * rank
-        rng = random.Random(seed)
-        print(f"Created a PretokDataset with rng seed {seed}")
+        seed = self._generate_rng_seed(worker_id, rank)
+        return random.Random(seed)
+
+    def _determine_bin_directory(self):
+        """Determine the directory containing bin files based on the vocab source."""
         if self.vocab_source == "llama2":
-            # the .bin files are right along the .json files
-            bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+            return os.path.join(self.data_cache_dir, "TinyStories_all_data")
         elif self.vocab_source == "custom":
-            # the .bin files are in tok{N} directory
-            bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
-        # train/test split. let's use only shard 0 for test split, rest train
-        shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
+            return os.path.join(self.data_cache_dir, f"tok{self.vocab_size}")
+        else:
+            raise ValueError(f"Unknown vocab source: {self.vocab_source}")
+
+    def _get_shard_filenames(self):
+        bin_dir = self._determine_bin_directory()
+        return sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+
+    def _filter_shard_filenames(self, shard_filenames):
+        """Filter shard filenames based on train/test split."""
+        return shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
+
+    def _read_shard_into_memory(self, shard):
+        return np.memmap(shard, dtype=np.uint16, mode="r")
+
+    def _create_batches_from_shard(self, shard_memmap):
+        """Divide the shard data into batches based on the specified maximum sequence length."""
+        num_batches = len(shard_memmap) // self.max_seq_len - 1
+        if num_batches <= 0:
+            raise ValueError("Shard too small. Investigate.")
+        return list(range(num_batches))
+
+    def __iter__(self):
+        rng = self._initialize_rng()
+        shard_filenames = self._get_shard_filenames()
+        shard_filenames = self._filter_shard_filenames(shard_filenames)
+
         while True:
             rng.shuffle(shard_filenames)
             for shard in shard_filenames:
-                # open the dataset for reading but keep it on disk with memmap
-                m = np.memmap(shard, dtype=np.uint16, mode="r")
-                num_batches = len(m) // self.max_seq_len
-                num_batches -= 1  # drop the last partial batch
-                assert num_batches > 0, "this shard is way too small? investigate."
-                ixs = list(range(num_batches))
-                rng.shuffle(ixs)
-                for ix in ixs:
+                shard_memmap = self._read_shard_into_memory(shard)
+                batch_indices = self._create_batches_from_shard(shard_memmap)
+                rng.shuffle(batch_indices)
+                
+                for ix in batch_indices:
                     start = ix * self.max_seq_len
                     end = start + self.max_seq_len + 1
-                    # calling .astype will copy the data into a new numpy array, now in RAM
-                    chunk = torch.from_numpy((m[start:end]).astype(np.int64))
-                    x = chunk[:-1]
-                    y = chunk[1:]
-                    yield x, y
-
+                    chunk = torch.from_numpy(shard_memmap[start:end].astype(np.int64))
+                    data,target = chunk[:-1], chunk[1:]
+                    yield data,target 
 # -----------------------------------------------------------------------------
 # public interface functions
 
@@ -246,6 +282,29 @@ class Task:
 # CLI for constructing the dataset
 
 if __name__ == "__main__":
+    vocab_source = "llama2" 
+    device = torch.device("cpu")
+    batch_size = 3
+    max_seq_len =10
+    vocab_size = 32000 
+    split = "train"
+    
+
+    iter_batches = partial(
+    Task.iter_batches,
+    batch_size=batch_size,
+    max_seq_len=max_seq_len,
+    vocab_size=vocab_size,
+    vocab_source=vocab_source,
+    device=device,
+    num_workers=0,
+    )
+
+    itr = batch_iter = iter_batches(split=split)
+
+    for idx,(x,y) in enumerate(itr):
+        print(idx)
+    
     """
     These stages are designed to be run in order.
 
@@ -272,3 +331,6 @@ if __name__ == "__main__":
         pretokenize(vocab_size=args.vocab_size)
     else:
         raise ValueError(f"Unknown stage {args.stage}")
+    
+
+    
