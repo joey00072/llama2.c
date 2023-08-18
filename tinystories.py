@@ -21,6 +21,13 @@ from tokenizer import Tokenizer
 
 DATA_CACHE_DIR = "data"
 
+data_dir_name = "TinyStories_all_data"
+data_url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories_all_data.tar.gz"
+
+finetuning_data_dir_name = "tinystories-instruct"
+finetuning_data_url = "https://huggingface.co/datasets/joey00072/TinyStories-SFT/resolve/main/tinystories-instruct.tar.gz"
+
+
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
     resp = requests.get(url, stream=True)
@@ -37,13 +44,14 @@ def download_file(url: str, fname: str, chunk_size=1024):
             bar.update(size)
 
 
-def download():
+def download(data_url: str, data_dir_name: str):
     """Downloads the TinyStories dataset to DATA_CACHE_DIR"""
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
     # download the TinyStories dataset, unless it's already downloaded
-    data_url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories_all_data.tar.gz"
-    data_filename = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data.tar.gz")
+    data_filename = os.path.join(DATA_CACHE_DIR, data_dir_name+".tar.gz")
+    print(f"{data_filename=}")
+    print(os.path.exists(data_filename))
     if not os.path.exists(data_filename):
         print(f"Downloading {data_url} to {data_filename}...")
         download_file(data_url, data_filename)
@@ -51,7 +59,7 @@ def download():
         print(f"{data_filename} already exists, skipping download...")
 
     # unpack the tar.gz file into all the data shards (json files)
-    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+    data_dir = os.path.join(DATA_CACHE_DIR, data_dir_name)
     if not os.path.exists(data_dir):
         os.makedirs(data_dir, exist_ok=True)
         print(f"Unpacking {data_filename}...")
@@ -59,13 +67,15 @@ def download():
     else:
         print(f"{data_dir} already exists, skipping unpacking...")
 
-    # print a single example just for debugging and such
+    # print a single example just for debugging and sudata_dirch
+    print(data_dir)
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     with open(shard_filenames[0], "r") as f:
         data = json.load(f)
     print("Download done.")
     print(f"Number of shards: {len(shard_filenames)}")
     print(f"Example story:\n{data[0]}")
+
 
 def train_vocab(vocab_size):
     """
@@ -150,9 +160,9 @@ def process_shard(args, vocab_size):
     print(f"Saved {tokenized_filename}, average seqlen: {avg_seq_len:.2f}")
 
 
-def pretokenize(vocab_size):
+def pretokenize(vocab_size, data_dir_name):
     # iterate the shards and tokenize all of them one by one
-    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+    data_dir = os.path.join(DATA_CACHE_DIR, data_dir_name)
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     if vocab_size > 0:
         # .bin files will be saved into tok{N} directory, create it once here
@@ -161,7 +171,7 @@ def pretokenize(vocab_size):
 
     # process all the shards in a process pool
     fun = partial(process_shard, vocab_size=vocab_size)
-    with ProcessPoolExecutor() as executor:
+    with ProcessPoolExecutor(max_workers=1) as executor:
         executor.map(fun, enumerate(shard_filenames))
     print("Done.")
 
@@ -169,12 +179,13 @@ def pretokenize(vocab_size):
 class PretokDataset(torch.utils.data.IterableDataset):
     """Loads pretokenized examples from disk and yields them as PyTorch tensors."""
 
-    def __init__(self, split, max_seq_len, vocab_size, vocab_source):
+    def __init__(self, split, max_seq_len, vocab_size, vocab_source,data_dir="TinyStories_all_data"):
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.vocab_source = vocab_source
+        self.data_dir = data_dir
 
     def __iter__(self):
         # get worker info within a DataLoader
@@ -188,14 +199,16 @@ class PretokDataset(torch.utils.data.IterableDataset):
         print(f"Created a PretokDataset with rng seed {seed}")
         if self.vocab_source == "llama2":
             # the .bin files are right along the .json files
-            bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+            bin_dir = os.path.join(DATA_CACHE_DIR,self.data_dir )
             shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
         elif self.vocab_source == "custom":
             # the .bin files are in tok{N} directory
             bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
             shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
         # train/test split. let's use only shard 0 for test split, rest train
-        shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
+        shard_filenames = (
+            shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
+        )
         while True:
             rng.shuffle(shard_filenames)
             for shard in shard_filenames:
@@ -215,8 +228,10 @@ class PretokDataset(torch.utils.data.IterableDataset):
                     y = chunk[1:]
                     yield x, y
 
+
 # -----------------------------------------------------------------------------
 # public interface functions
+
 
 def get_tokenizer_model_path(vocab_size):
     """
@@ -229,8 +244,8 @@ def get_tokenizer_model_path(vocab_size):
     else:
         return os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}.model")
 
-class Task:
 
+class Task:
     @staticmethod
     def iter_batches(batch_size, device, num_workers=0, **dataset_kwargs):
         ds = PretokDataset(**dataset_kwargs)
@@ -241,6 +256,7 @@ class Task:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             yield x, y
+
 
 # -----------------------------------------------------------------------------
 # CLI for constructing the dataset
@@ -259,16 +275,35 @@ if __name__ == "__main__":
     python tinystories.py pretokenize --vocab_size=2048
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", type=str, choices=["download", "pretokenize", "train_vocab"])
-    parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
+    parser.add_argument(
+        "stage",
+        type=str,
+        choices=[
+            "download",
+            "pretokenize",
+            "train_vocab",
+            "download_finetune",
+            "pretokenize_finetune",
+        ],
+    )
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        default=0,
+        help="pretokenization vocab size. 0 = use Llama 2 tokenizer.",
+    )
     args = parser.parse_args()
 
+    if "finetune" in args.stage:
+        data_dir_name = finetuning_data_dir_name
+        data_url = finetuning_data_url
+
     # depending on the stage call the appropriate function
-    if args.stage == "download":
-        download()
-    elif args.stage == "train_vocab":
+    if "download" in args.stage:
+        download(data_url=data_url, data_dir_name=data_dir_name)
+    elif "train_vocab" in args.stage:
         train_vocab(vocab_size=args.vocab_size)
-    elif args.stage == "pretokenize":
-        pretokenize(vocab_size=args.vocab_size)
+    elif "pretokenize" in args.stage:
+        pretokenize(vocab_size=args.vocab_size, data_dir_name=data_dir_name)
     else:
         raise ValueError(f"Unknown stage {args.stage}")

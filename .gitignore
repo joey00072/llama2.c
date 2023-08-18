@@ -1,0 +1,7 @@
+data/
+wandb/
+pycache/
+*.pyc
+*.pt
+*.bin
+.vscode/
