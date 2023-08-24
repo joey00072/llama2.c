@@ -27,7 +27,7 @@ import torch
 from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from pytorch_lightning.utilities.model_summary import ModelSummary
 from tinystories import Task
 from export import model_export
 
@@ -45,8 +45,7 @@ wandb_log = True  # disabled by default
 wandb_project = "ghostmax"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
-BG = 4 # changine grad acc step sine not using multipal gpus
-batch_size = 128 // BG # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 16  # if gradient_accumulation_steps > 1, this is the micro-batch size
 max_seq_len = 512
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
 vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
@@ -58,7 +57,7 @@ n_kv_heads = 8
 multiple_of = 32
 dropout = 0.0
 # adamw optimizer
-gradient_accumulation_steps = 4 * BG # used to simulate larger batch sizes
+gradient_accumulation_steps = 4 # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
@@ -196,6 +195,7 @@ if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
+print(ModelSummary(model))
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")

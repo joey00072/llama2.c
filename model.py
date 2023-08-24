@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import pytorch_lightning as L
 
 def softmax(x, dim=None):
     e_x = torch.exp(x - torch.max(x, dim=dim, keepdim=True)[0]) 
@@ -218,7 +219,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Transformer(nn.Module):
+class Transformer(L.LightningModule):
     last_loss: Optional[torch.Tensor]
 
     def __init__(self, params: ModelArgs):
