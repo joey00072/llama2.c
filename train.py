@@ -34,7 +34,7 @@ from export import model_export
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
-eval_interval = 2000
+eval_interval = 200 #eval at 200 cause I like staring at loss
 log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
