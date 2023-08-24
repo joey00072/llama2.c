@@ -31,8 +31,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
-    ghostmax = False
-    flash = True
+    ghostmax: bool = False
+    flash: bool = True
 
 
 class RMSNorm(torch.nn.Module):
