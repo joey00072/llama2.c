@@ -9,6 +9,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
+def softmax(x, dim=None):
+    e_x = torch.exp(x - torch.max(x, dim=dim, keepdim=True)[0]) 
+    return e_x / e_x.sum(dim=dim, keepdim=True)    
+
+def ghostmax(x, dim=None):
+    e_x = torch.exp(x - torch.max(x, dim=dim, keepdim=True)[0]) 
+    return e_x / (1+e_x.sum(dim=dim, keepdim=True) )
+
 @dataclass
 class ModelArgs:
     # default hyperparameters for the Llama 7B model
@@ -22,6 +31,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    ghostmax = False
+    flash = True
 
 
 class RMSNorm(torch.nn.Module):
@@ -108,9 +119,10 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        self.ghostmax = args.ghostmax
 
         # use flash attention or a manual implementation?
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') if args.flash else False
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
@@ -151,7 +163,10 @@ class Attention(nn.Module):
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
             scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            if self.ghostmax:
+                scores = ghostmax(scores.float(), dim=-1).type_as(xq)
+            else:
+                scores = softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
 
